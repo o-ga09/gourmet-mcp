@@ -1,0 +1,85 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - "main"
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
+  SERVICE_ACCOUNT: ${{ secrets.SERVICE_ACCOUNT }}
+  IMAGE: asia-northeast1-docker.pkg.dev/mh-api-389212/gourmet/gourmet-mcp:${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build and Push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/${{ env.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/terraform-pool/providers/terraform-provider"
+          service_account: "${{ env.SERVICE_ACCOUNT }}"
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-northeast1-docker.pkg.dev
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64
+
+      - name: Build and Push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          target: deploy
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # k8s 向け（ArgoCD）マニフェスト更新。o-ga09/infra の main への push は即本番反映になる
+  update-k8s-manifest:
+    name: Update Kubernetes Manifests (ArgoCD)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout infra repository
+        uses: actions/checkout@v4
+        with:
+          repository: o-ga09/infra
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Update image tag
+        id: update
+        env:
+          MANIFEST: manifests/gourmet-mcp/mcp-deployment.yaml
+        run: |
+          # infra 側のマニフェスト（o-ga09/infra#3）が未作成の間はスキップする
+          if [ ! -f "$MANIFEST" ]; then
+            echo "$MANIFEST not found; skip"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REGISTRY="asia-northeast1-docker.pkg.dev/mh-api-389212/gourmet"
+          sed -i "s|${REGISTRY}/gourmet-mcp:.*|${REGISTRY}/gourmet-mcp:${{ github.sha }}|" "$MANIFEST"
+
+      - name: Commit and Push
+        if: steps.update.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifests/gourmet-mcp/
+          git diff --cached --quiet || git commit -m "chore: update gourmet-mcp image tag to ${{ github.sha }}"
+          git push
